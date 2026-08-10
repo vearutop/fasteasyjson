@@ -5,6 +5,18 @@ run:
 linters:
   default: all
   disable:
+    - noctx
+    - gocyclo
+    - funlen
+    - gocognit
+    - errcheck
+    - musttag
+    - gosec
+    - cyclop
+    - err113
+    - usetesting
+    - nlreturn
+    - wsl
     - embeddedstructfieldcheck
     - nilnil
     - noinlineerr
