@@ -19,7 +19,7 @@ every CI run.
 
 `fasteasyjson` produces the same output through the same underlying mechanism:
 it depends on `mailru/easyjson`'s own `bootstrap`, `parser`, and `gen`
-packages rather than reimplementing generation.
+packages rather than reimplementing generation (this tool is just ~500 LoC in total).
 
 - The launcher gets a deterministic name, a hash of its group's target
   paths, instead of a random one, so its compile+link action is a stable,
@@ -47,8 +47,7 @@ packages rather than reimplementing generation.
   disk.
 - `-check` performs the same generation but never writes; it reports each
   stale file and exits 1 if any are found.
-- Generation runs strictly one group at a time, never concurrently. See
-  "Known tradeoffs" below.
+- Generation runs strictly one group at a time, never concurrently to avoid overlay corruptions.
 
 ## Performance
 
