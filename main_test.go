@@ -197,21 +197,28 @@ func TestGoldenEquivalence(t *testing.T) {
 			t.Fatalf("reading fasteasyjson output %s: %v", o, err)
 		}
 		fastOut[o] = b
-		if err := os.Remove(o); err != nil {
-			t.Fatal(err)
+	}
+	removeAll()
+
+	// Run the original generator once per file, in source order, leaving
+	// each file's real output on disk for the rest of the loop - this
+	// mirrors `go generate ./...` running one //go:generate directive per
+	// file, where an earlier file's real generated output in the same
+	// package is still on disk (and so already satisfies the
+	// Marshaler/Unmarshaler interfaces) by the time a later file that
+	// references its types is generated.
+	for _, f := range goldenFiles {
+		if out, err := runTool(origBin, f); err != nil {
+			t.Fatalf("easyjson generate failed for %s: %s: %v", f, out, err)
 		}
 	}
 
 	for i, f := range goldenFiles {
 		o := outNames[i]
-		if out, err := runTool(origBin, f); err != nil {
-			t.Fatalf("easyjson generate failed for %s: %s: %v", f, out, err)
-		}
 		origBytes, err := os.ReadFile(o)
 		if err != nil {
 			t.Fatalf("reading easyjson output %s: %v", o, err)
 		}
-		_ = os.Remove(o)
 
 		t.Run(f, func(t *testing.T) {
 			if !bytes.Equal(fastOut[o], origBytes) {
