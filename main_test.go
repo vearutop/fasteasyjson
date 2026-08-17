@@ -90,6 +90,65 @@ func TestGenerateAndCheck(t *testing.T) {
 	}
 }
 
+// TestGenerateBatchWithZeroStructPackage guards against a package that
+// contributes no types to its batch (a file matched by an easyjson tool but
+// with no annotated struct) making the launcher's import of that package
+// unused, which fails the whole batch's build.
+func TestGenerateBatchWithZeroStructPackage(t *testing.T) {
+	bin := buildBinary(t)
+
+	emptyDir, err := os.MkdirTemp("testdata", "pkgempty_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(emptyDir) }()
+	emptySrc := filepath.Join(emptyDir, "empty.go")
+	if err := os.WriteFile(emptySrc, []byte("package pkgempty\n\ntype Unannotated struct {\n\tField string\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fullDir, err := os.MkdirTemp("testdata", "pkgfull_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(fullDir) }()
+	fullSrc := filepath.Join(fullDir, "sample.go")
+	writeSample(t, fullSrc, "First string")
+
+	if out, err := runTool(bin, emptySrc, fullSrc); err != nil {
+		t.Fatalf("batch with a zero-struct package failed: %s: %v", out, err)
+	}
+}
+
+// TestGenerateIndependentOfCWD guards against resolving the target package
+// against the tool's own process working directory instead of the
+// launcher's location: running from outside any module must not change
+// what gets generated.
+func TestGenerateIndependentOfCWD(t *testing.T) {
+	bin := buildBinary(t)
+
+	dir, err := os.MkdirTemp("testdata", "pkgcwd_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	src := filepath.Join(dir, "sample.go")
+	writeSample(t, src, "First string")
+	absSrc, err := filepath.Abs(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, absSrc)
+	cmd.Dir = t.TempDir() // outside any module
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generate from outside the module failed: %s: %v", out, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sample_easyjson.go")); err != nil {
+		t.Fatalf("expected generated output next to the target: %v", err)
+	}
+}
+
 func writeSample(t *testing.T, path, field string) {
 	t.Helper()
 
