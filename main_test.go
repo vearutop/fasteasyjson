@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,6 +89,173 @@ func TestGenerateAndCheck(t *testing.T) {
 	if string(before) == string(after2) {
 		t.Fatal("expected regenerated content to differ after the struct change")
 	}
+}
+
+// TestGenerateBatchWithZeroStructPackage guards against a package that
+// contributes no types to its batch (a file matched by an easyjson tool but
+// with no annotated struct) making the launcher's import of that package
+// unused, which fails the whole batch's build.
+func TestGenerateBatchWithZeroStructPackage(t *testing.T) {
+	bin := buildBinary(t)
+
+	emptyDir, err := os.MkdirTemp("testdata", "pkgempty_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(emptyDir) }()
+	emptySrc := filepath.Join(emptyDir, "empty.go")
+	if err := os.WriteFile(emptySrc, []byte("package pkgempty\n\ntype Unannotated struct {\n\tField string\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fullDir, err := os.MkdirTemp("testdata", "pkgfull_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(fullDir) }()
+	fullSrc := filepath.Join(fullDir, "sample.go")
+	writeSample(t, fullSrc, "First string")
+
+	if out, err := runTool(bin, emptySrc, fullSrc); err != nil {
+		t.Fatalf("batch with a zero-struct package failed: %s: %v", out, err)
+	}
+}
+
+// TestGenerateIndependentOfCWD guards against resolving the target package
+// against the tool's own process working directory instead of the
+// launcher's location: running from outside any module must not change
+// what gets generated.
+func TestGenerateIndependentOfCWD(t *testing.T) {
+	bin := buildBinary(t)
+
+	dir, err := os.MkdirTemp("testdata", "pkgcwd_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	src := filepath.Join(dir, "sample.go")
+	writeSample(t, src, "First string")
+	absSrc, err := filepath.Abs(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, absSrc)
+	cmd.Dir = t.TempDir() // outside any module
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generate from outside the module failed: %s: %v", out, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sample_easyjson.go")); err != nil {
+		t.Fatalf("expected generated output next to the target: %v", err)
+	}
+}
+
+// goldenFiles is a fixture spanning every grouping seam in main(): pkga and
+// pkgb are different public packages sharing one launcher; pkgc joins them
+// as a third public package; pkgd and pkge both sit under pkgc/internal and
+// so must share one internal-ancestor launcher instead of the public one;
+// pkgd's two files exercise a package contributing to a batch through more
+// than one target while still sharing a single import alias.
+var goldenFiles = []string{
+	"testdata/golden/pkga/types.go",
+	"testdata/golden/pkgb/types.go",
+	"testdata/golden/pkgc/uses.go",
+	"testdata/golden/pkgc/internal/pkgd/types.go",
+	"testdata/golden/pkgc/internal/pkgd/types2.go",
+	"testdata/golden/pkgc/internal/pkge/types.go",
+}
+
+// TestGoldenEquivalence is the test the batching/grouping logic actually
+// rests on: that fasteasyjson's single batched, grouped run produces
+// byte-identical output to the original easyjson generator invoked once per
+// file, the way a real //go:generate line would. Neither binary is trusted
+// as a fixed "golden" answer - they are each other's oracle, run fresh
+// every time, so there is nothing stale to keep in sync by hand.
+func TestGoldenEquivalence(t *testing.T) {
+	fastBin := buildBinary(t)
+	origBin := buildEasyjsonBinary(t)
+
+	outNames := make([]string, len(goldenFiles))
+	for i, f := range goldenFiles {
+		outNames[i] = strings.TrimSuffix(f, ".go") + "_easyjson.go"
+	}
+	removeAll := func() {
+		for _, o := range outNames {
+			_ = os.Remove(o)
+		}
+	}
+	removeAll()
+	defer removeAll()
+
+	if out, err := runTool(fastBin, goldenFiles...); err != nil {
+		t.Fatalf("fasteasyjson batch generate failed: %s: %v", out, err)
+	}
+	fastOut := make(map[string][]byte, len(outNames))
+	for _, o := range outNames {
+		b, err := os.ReadFile(o)
+		if err != nil {
+			t.Fatalf("reading fasteasyjson output %s: %v", o, err)
+		}
+		fastOut[o] = b
+	}
+	removeAll()
+
+	// Run the original generator once per file, in source order, leaving
+	// each file's real output on disk for the rest of the loop - this
+	// mirrors `go generate ./...` running one //go:generate directive per
+	// file, where an earlier file's real generated output in the same
+	// package is still on disk (and so already satisfies the
+	// Marshaler/Unmarshaler interfaces) by the time a later file that
+	// references its types is generated.
+	for _, f := range goldenFiles {
+		if out, err := runTool(origBin, f); err != nil {
+			t.Fatalf("easyjson generate failed for %s: %s: %v", f, out, err)
+		}
+	}
+
+	for i, f := range goldenFiles {
+		o := outNames[i]
+		origBytes, err := os.ReadFile(o)
+		if err != nil {
+			t.Fatalf("reading easyjson output %s: %v", o, err)
+		}
+
+		t.Run(f, func(t *testing.T) {
+			if !bytes.Equal(fastOut[o], origBytes) {
+				t.Errorf("fasteasyjson output differs from easyjson:\n%s", diffBytes(t, fastOut[o], origBytes))
+			}
+		})
+	}
+}
+
+func buildEasyjsonBinary(t *testing.T) string {
+	t.Helper()
+
+	bin := filepath.Join(t.TempDir(), "easyjson")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/mailru/easyjson/easyjson")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %s: %v", out, err)
+	}
+	return bin
+}
+
+// diffBytes shells out to the system `diff` for a readable failure message -
+// this only runs when a test already failed, so it doesn't need to be fast
+// or dependency-free the way the generator paths do.
+func diffBytes(t *testing.T, fast, orig []byte) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	fastPath := filepath.Join(dir, "fasteasyjson.go")
+	origPath := filepath.Join(dir, "easyjson.go")
+	if err := os.WriteFile(fastPath, fast, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(origPath, orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := exec.Command("diff", "-u", origPath, fastPath).CombinedOutput()
+	return string(out)
 }
 
 func writeSample(t *testing.T, path, field string) {

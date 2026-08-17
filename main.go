@@ -283,7 +283,9 @@ func internalAncestorDir(pkgPath, outName string) (string, bool) {
 //
 // launcherDir is where the launcher file itself must be created: empty for
 // a group with no `internal/`-constrained target (any directory works, so
-// the scratch dir is reused), otherwise the on-disk directory computed by
+// it is placed next to one of the group's own targets, guaranteeing it
+// lives in the right module regardless of the process's own working
+// directory), otherwise the on-disk directory computed by
 // internalAncestorDir - Go's "internal/" import visibility is decided by
 // the importing file's on-disk location, so a launcher outside that tree
 // cannot import a target under .../internal/...
@@ -306,8 +308,8 @@ func generateGroup(targets []*target, launcherDir string) (map[string][]byte, er
 	}
 	sum := hash.Sum32()
 
-	scratch := filepath.Join(os.TempDir(), fmt.Sprintf("fasteasyjson-%x", sum))
-	if err := os.MkdirAll(scratch, 0o700); err != nil {
+	scratch, err := os.MkdirTemp("", fmt.Sprintf("fasteasyjson-%x-", sum))
+	if err != nil {
 		return nil, err
 	}
 	if !*leaveTemps {
@@ -350,7 +352,7 @@ func generateGroup(targets []*target, launcherDir string) (map[string][]byte, er
 	mainName := fmt.Sprintf("fasteasyjson-bootstrap-%x.go", sum)
 	mainDir := launcherDir
 	if mainDir == "" {
-		mainDir = scratch
+		mainDir = filepath.Dir(outNames[0])
 	}
 	mainPath := filepath.Join(mainDir, mainName)
 	if err := os.WriteFile(mainPath, mainSource(base, targets), 0o600); err != nil {
@@ -358,14 +360,6 @@ func generateGroup(targets []*target, launcherDir string) (map[string][]byte, er
 	}
 	if !*leaveTemps {
 		defer func() { _ = os.Remove(mainPath) }()
-	}
-
-	cmdDir := launcherDir
-	if cmdDir == "" {
-		cmdDir, err = os.Getwd()
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	execArgs := []string{"run", "-trimpath", "-overlay=" + overlayPath}
@@ -379,7 +373,7 @@ func generateGroup(targets []*target, launcherDir string) (map[string][]byte, er
 
 	var stdout, stderr bytes.Buffer
 	cmd := exec.Command("go", execArgs...)
-	cmd.Dir = cmdDir
+	cmd.Dir = mainDir
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -460,6 +454,12 @@ func mainSource(base *bootstrap.Generator, targets []*target) []byte {
 	alias := map[string]string{}
 	var pkgPaths []string
 	for _, t := range targets {
+		if len(t.types) == 0 {
+			// No types to reference below, so no import to alias: an alias
+			// with nothing referencing it is an unused import, which fails
+			// the build.
+			continue
+		}
 		if _, ok := alias[t.pkgPath]; !ok {
 			alias[t.pkgPath] = fmt.Sprintf("pkg%d", len(pkgPaths))
 			pkgPaths = append(pkgPaths, t.pkgPath)
