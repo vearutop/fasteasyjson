@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -147,6 +148,107 @@ func TestGenerateIndependentOfCWD(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "sample_easyjson.go")); err != nil {
 		t.Fatalf("expected generated output next to the target: %v", err)
 	}
+}
+
+// goldenFiles is a fixture spanning every grouping seam in main(): pkga and
+// pkgb are different public packages sharing one launcher; pkgc joins them
+// as a third public package; pkgd and pkge both sit under pkgc/internal and
+// so must share one internal-ancestor launcher instead of the public one;
+// pkgd's two files exercise a package contributing to a batch through more
+// than one target while still sharing a single import alias.
+var goldenFiles = []string{
+	"testdata/golden/pkga/types.go",
+	"testdata/golden/pkgb/types.go",
+	"testdata/golden/pkgc/uses.go",
+	"testdata/golden/pkgc/internal/pkgd/types.go",
+	"testdata/golden/pkgc/internal/pkgd/types2.go",
+	"testdata/golden/pkgc/internal/pkge/types.go",
+}
+
+// TestGoldenEquivalence is the test the batching/grouping logic actually
+// rests on: that fasteasyjson's single batched, grouped run produces
+// byte-identical output to the original easyjson generator invoked once per
+// file, the way a real //go:generate line would. Neither binary is trusted
+// as a fixed "golden" answer - they are each other's oracle, run fresh
+// every time, so there is nothing stale to keep in sync by hand.
+func TestGoldenEquivalence(t *testing.T) {
+	fastBin := buildBinary(t)
+	origBin := buildEasyjsonBinary(t)
+
+	outNames := make([]string, len(goldenFiles))
+	for i, f := range goldenFiles {
+		outNames[i] = strings.TrimSuffix(f, ".go") + "_easyjson.go"
+	}
+	removeAll := func() {
+		for _, o := range outNames {
+			_ = os.Remove(o)
+		}
+	}
+	removeAll()
+	defer removeAll()
+
+	if out, err := runTool(fastBin, goldenFiles...); err != nil {
+		t.Fatalf("fasteasyjson batch generate failed: %s: %v", out, err)
+	}
+	fastOut := make(map[string][]byte, len(outNames))
+	for _, o := range outNames {
+		b, err := os.ReadFile(o)
+		if err != nil {
+			t.Fatalf("reading fasteasyjson output %s: %v", o, err)
+		}
+		fastOut[o] = b
+		if err := os.Remove(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i, f := range goldenFiles {
+		o := outNames[i]
+		if out, err := runTool(origBin, f); err != nil {
+			t.Fatalf("easyjson generate failed for %s: %s: %v", f, out, err)
+		}
+		origBytes, err := os.ReadFile(o)
+		if err != nil {
+			t.Fatalf("reading easyjson output %s: %v", o, err)
+		}
+		_ = os.Remove(o)
+
+		t.Run(f, func(t *testing.T) {
+			if !bytes.Equal(fastOut[o], origBytes) {
+				t.Errorf("fasteasyjson output differs from easyjson:\n%s", diffBytes(t, fastOut[o], origBytes))
+			}
+		})
+	}
+}
+
+func buildEasyjsonBinary(t *testing.T) string {
+	t.Helper()
+
+	bin := filepath.Join(t.TempDir(), "easyjson")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/mailru/easyjson/easyjson")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %s: %v", out, err)
+	}
+	return bin
+}
+
+// diffBytes shells out to the system `diff` for a readable failure message -
+// this only runs when a test already failed, so it doesn't need to be fast
+// or dependency-free the way the generator paths do.
+func diffBytes(t *testing.T, fast, orig []byte) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	fastPath := filepath.Join(dir, "fasteasyjson.go")
+	origPath := filepath.Join(dir, "easyjson.go")
+	if err := os.WriteFile(fastPath, fast, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(origPath, orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := exec.Command("diff", "-u", origPath, fastPath).CombinedOutput()
+	return string(out)
 }
 
 func writeSample(t *testing.T, path, field string) {
